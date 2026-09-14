@@ -61,6 +61,9 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         _ = self.table.get(&network)?;
 
         let remote_address: SocketAddr = remote_address.into();
+        if let Some(obs) = &self.ctx.boundary_observer {
+            obs.on_start_connect(remote_address);
+        }
         let socket = self.table.get_mut(&this)?;
         if socket.in_progress_operation.is_some() {
             return Err(ErrorCode::ConcurrencyConflict.into());
@@ -89,7 +92,7 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
             return Err(e.into());
         }
 
-        let (input, output) = socket.take_streams()?;
+        let (input, output) = socket.take_streams(self.ctx.boundary_observer.clone())?;
         let input = self.table.push_child(input, &this)?;
         let output = self.table.push_child(output, &this)?;
         Ok((input, output))
@@ -139,7 +142,8 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
             Poll::Ready(accepted) => accepted,
         };
         let mut tcp_socket = TcpSocket::new(accepted);
-        let (input, output) = tcp_socket.take_streams()?;
+        let observer = self.ctx.boundary_observer.clone();
+        let (input, output) = tcp_socket.take_streams(observer)?;
 
         let tcp_socket = self.table.push(tcp_socket)?;
         let input_stream = self.table.push_child(input, &tcp_socket)?;

@@ -62,10 +62,29 @@ impl HasData for WasiSockets {
     type Data<'a> = WasiSocketsCtxView<'a>;
 }
 
+/// Optional host callback invoked at guest-facing TCP boundaries.
+///
+/// Used by request-tracing embeddings to bind a previously snapshotted guest
+/// task identity to `start-connect` and stream read/write events. No-op when
+/// unset (default).
+pub trait SocketBoundaryObserver: Send + Sync {
+    fn on_start_connect(&self, remote: SocketAddr);
+    fn on_tcp_read(&self, bytes: &[u8]);
+    fn on_tcp_write(&self, bytes: &[u8]);
+}
+
 #[derive(Clone, Default)]
 pub struct WasiSocketsCtx {
     pub(crate) socket_addr_check: SocketAddrCheck,
     pub(crate) allowed_network_uses: AllowedNetworkUses,
+    pub(crate) boundary_observer: Option<Arc<dyn SocketBoundaryObserver>>,
+}
+
+impl WasiSocketsCtx {
+    /// Install a socket-boundary observer (tracing embeddings).
+    pub fn set_boundary_observer(&mut self, observer: Arc<dyn SocketBoundaryObserver>) {
+        self.boundary_observer = Some(observer);
+    }
 }
 
 pub struct WasiSocketsCtxView<'a> {
