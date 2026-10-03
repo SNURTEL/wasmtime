@@ -61,13 +61,19 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         _ = self.table.get(&network)?;
 
         let remote_address: SocketAddr = remote_address.into();
-        if let Some(obs) = &self.ctx.boundary_observer {
-            obs.on_start_connect(remote_address);
-        }
         let socket = self.table.get_mut(&this)?;
         if socket.in_progress_operation.is_some() {
             return Err(ErrorCode::ConcurrencyConflict.into());
         }
+
+        let conn_id = if let Some(obs) = &self.ctx.boundary_observer {
+            let id = obs.allocate_connection();
+            obs.on_start_connect(id, remote_address);
+            Some(id)
+        } else {
+            None
+        };
+        socket.trace_conn_id = conn_id;
 
         socket.inner.start_connect(remote_address)?;
         socket.in_progress_operation = Some(AsyncOperation::Connect);
@@ -92,7 +98,8 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
             return Err(e.into());
         }
 
-        let (input, output) = socket.take_streams(self.ctx.boundary_observer.clone())?;
+        let conn_id = socket.trace_conn_id.unwrap_or(0);
+        let (input, output) = socket.take_streams(self.ctx.boundary_observer.clone(), conn_id)?;
         let input = self.table.push_child(input, &this)?;
         let output = self.table.push_child(output, &this)?;
         Ok((input, output))
@@ -143,7 +150,15 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
         };
         let mut tcp_socket = TcpSocket::new(accepted);
         let observer = self.ctx.boundary_observer.clone();
-        let (input, output) = tcp_socket.take_streams(observer)?;
+        let conn_id = if let Some(obs) = &observer {
+            let id = obs.allocate_connection();
+            obs.on_accept(id);
+            id
+        } else {
+            0
+        };
+        tcp_socket.trace_conn_id = Some(conn_id);
+        let (input, output) = tcp_socket.take_streams(observer, conn_id)?;
 
         let tcp_socket = self.table.push(tcp_socket)?;
         let input_stream = self.table.push_child(input, &tcp_socket)?;

@@ -21,6 +21,8 @@ pub struct TcpSocket {
     pub(crate) inner: P3Socket,
     pub(crate) in_progress_operation: Option<AsyncOperation>,
     pub(crate) listener: Option<TcpListenStream>,
+    /// Host tracing connection id assigned at start-connect (egress) or accept.
+    pub(crate) trace_conn_id: Option<u64>,
     reader: Option<TcpReader>,
     writer: Option<TcpWriter>,
 }
@@ -38,6 +40,7 @@ impl TcpSocket {
             inner,
             in_progress_operation: None,
             listener: None,
+            trace_conn_id: None,
             reader: None,
             writer: None,
         }
@@ -45,9 +48,10 @@ impl TcpSocket {
     pub(crate) fn take_streams(
         &mut self,
         observer: Option<Arc<dyn SocketBoundaryObserver>>,
+        conn_id: u64,
     ) -> SocketResult<(DynInputStream, DynOutputStream)> {
-        let reader = TcpReader::new(self.inner.take_receive_stream()?, observer.clone());
-        let writer = TcpWriter::new(self.inner.take_send_stream()?, observer);
+        let reader = TcpReader::new(self.inner.take_receive_stream()?, observer.clone(), conn_id);
+        let writer = TcpWriter::new(self.inner.take_send_stream()?, observer, conn_id);
         self.reader = Some(reader.clone());
         self.writer = Some(writer.clone());
         let input: DynInputStream = Box::new(reader);
@@ -116,12 +120,18 @@ impl ReadState {
 struct TcpReader {
     state: Arc<Mutex<ReadState>>,
     observer: Option<Arc<dyn SocketBoundaryObserver>>,
+    conn_id: u64,
 }
 impl TcpReader {
-    fn new(stream: TcpReceiveStream, observer: Option<Arc<dyn SocketBoundaryObserver>>) -> Self {
+    fn new(
+        stream: TcpReceiveStream,
+        observer: Option<Arc<dyn SocketBoundaryObserver>>,
+        conn_id: u64,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ReadState::Open(stream))),
             observer,
+            conn_id,
         }
     }
 }
@@ -132,7 +142,7 @@ impl InputStream for TcpReader {
         let bytes = self.state.lock().unwrap().read(size)?;
         if !bytes.is_empty() {
             if let Some(obs) = &self.observer {
-                obs.on_tcp_read(&bytes);
+                obs.on_tcp_read(self.conn_id, &bytes);
             }
         }
         Ok(bytes)
@@ -302,12 +312,18 @@ impl WriteState {
 struct TcpWriter {
     state: Arc<Mutex<WriteState>>,
     observer: Option<Arc<dyn SocketBoundaryObserver>>,
+    conn_id: u64,
 }
 impl TcpWriter {
-    fn new(stream: TcpSendStream, observer: Option<Arc<dyn SocketBoundaryObserver>>) -> Self {
+    fn new(
+        stream: TcpSendStream,
+        observer: Option<Arc<dyn SocketBoundaryObserver>>,
+        conn_id: u64,
+    ) -> Self {
         Self {
             state: Arc::new(Mutex::new(WriteState::Ready(stream, 0))),
             observer,
+            conn_id,
         }
     }
 }
@@ -315,11 +331,11 @@ impl TcpWriter {
 #[async_trait::async_trait]
 impl OutputStream for TcpWriter {
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
-        if !bytes.is_empty() {
-            if let Some(obs) = &self.observer {
-                obs.on_tcp_write(&bytes);
-            }
-        }
+        let bytes = if let Some(obs) = &self.observer {
+            obs.transform_tcp_write(self.conn_id, bytes)
+        } else {
+            bytes
+        };
         self.state.lock().unwrap().write(bytes)
     }
 

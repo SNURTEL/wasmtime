@@ -65,12 +65,26 @@ impl HasData for WasiSockets {
 /// Optional host callback invoked at guest-facing TCP boundaries.
 ///
 /// Used by request-tracing embeddings to bind a previously snapshotted guest
-/// task identity to `start-connect` and stream read/write events. No-op when
-/// unset (default).
+/// task identity to connections and to optionally rewrite outbound HTTP bytes.
+/// No-op / identity when unset (default).
 pub trait SocketBoundaryObserver: Send + Sync {
-    fn on_start_connect(&self, remote: SocketAddr);
-    fn on_tcp_read(&self, bytes: &[u8]);
-    fn on_tcp_write(&self, bytes: &[u8]);
+    /// Allocate a host-local connection id (monotonic, never a bare fd).
+    fn allocate_connection(&self) -> u64;
+
+    fn on_start_connect(&self, conn_id: u64, remote: SocketAddr);
+
+    fn on_accept(&self, conn_id: u64) {
+        let _ = conn_id;
+    }
+
+    fn on_tcp_read(&self, conn_id: u64, bytes: &[u8]);
+
+    /// Transform guest write bytes before they reach the native socket.
+    /// Observe-only embeddings return `bytes` unchanged.
+    fn transform_tcp_write(&self, conn_id: u64, bytes: bytes::Bytes) -> bytes::Bytes {
+        let _ = conn_id;
+        bytes
+    }
 }
 
 #[derive(Clone, Default)]
