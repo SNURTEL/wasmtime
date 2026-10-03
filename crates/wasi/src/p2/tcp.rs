@@ -332,19 +332,58 @@ impl TcpWriter {
 impl OutputStream for TcpWriter {
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
         let bytes = if let Some(obs) = &self.observer {
-            obs.transform_tcp_write(self.conn_id, bytes)
+            match obs.accept_tcp_write(self.conn_id, bytes) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
+                        e.message(),
+                    )));
+                }
+            }
         } else {
             bytes
         };
+        if bytes.is_empty() {
+            return Ok(());
+        }
         self.state.lock().unwrap().write(bytes)
     }
 
     fn flush(&mut self) -> StreamResult<()> {
+        if let Some(obs) = &self.observer {
+            if let Err(e) = obs.flush_tcp_write(self.conn_id) {
+                return Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
+                    e.message(),
+                )));
+            }
+        }
         self.state.lock().unwrap().flush()
     }
 
     fn check_write(&mut self) -> StreamResult<usize> {
-        self.state.lock().unwrap().check_write()
+        let native = self.state.lock().unwrap().check_write()?;
+        if let Some(obs) = &self.observer {
+            match obs.check_tcp_write(self.conn_id, native) {
+                Ok(n) => Ok(n),
+                Err(e) => Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
+                    e.message(),
+                ))),
+            }
+        } else {
+            Ok(native)
+        }
+    }
+
+    fn write_zeroes(&mut self, nelem: usize) -> StreamResult<()> {
+        // Always route through `write` so an installed boundary observer sees bytes.
+        let n = self.check_write()?;
+        if nelem > n {
+            return Err(StreamError::trap(
+                "cannot write more zeroes than `check_write` allows",
+            ));
+        }
+        let bs = bytes::Bytes::from_iter(core::iter::repeat(0).take(nelem));
+        self.write(bs)
     }
 
     async fn cancel(&mut self) {

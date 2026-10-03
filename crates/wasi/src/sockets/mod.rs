@@ -62,6 +62,30 @@ impl HasData for WasiSockets {
     type Data<'a> = WasiSocketsCtxView<'a>;
 }
 
+/// Error returned from traced TCP write/flush/check paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpBoundaryError {
+    PartialHeadFlush,
+    HeaderTooLarge,
+    SecondExchange,
+    Protocol,
+    Failed,
+    Unsupported(&'static str),
+}
+
+impl TcpBoundaryError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::PartialHeadFlush => "wasmtrace: partial-head flush while buffering request head",
+            Self::HeaderTooLarge => "wasmtrace: request head too large",
+            Self::SecondExchange => "wasmtrace: second HTTP exchange on connection",
+            Self::Protocol => "wasmtrace: HTTP framing error",
+            Self::Failed => "wasmtrace: egress stream failed",
+            Self::Unsupported(s) => s,
+        }
+    }
+}
+
 /// Optional host callback invoked at guest-facing TCP boundaries.
 ///
 /// Used by request-tracing embeddings to bind a previously snapshotted guest
@@ -79,11 +103,42 @@ pub trait SocketBoundaryObserver: Send + Sync {
 
     fn on_tcp_read(&self, conn_id: u64, bytes: &[u8]);
 
+    /// Accept guest write bytes. Returns wire bytes to send to the native socket
+    /// (may be empty while buffering an incomplete HTTP head).
+    fn accept_tcp_write(
+        &self,
+        conn_id: u64,
+        bytes: bytes::Bytes,
+    ) -> Result<bytes::Bytes, TcpBoundaryError> {
+        let _ = conn_id;
+        Ok(bytes)
+    }
+
+    /// Cap guest write capacity given the native stream permit.
+    fn check_tcp_write(
+        &self,
+        conn_id: u64,
+        native_permit: usize,
+    ) -> Result<usize, TcpBoundaryError> {
+        let _ = conn_id;
+        Ok(native_permit)
+    }
+
+    /// Honor WASI flush. Errors on partial-head flush in strict trace mode.
+    fn flush_tcp_write(&self, conn_id: u64) -> Result<(), TcpBoundaryError> {
+        let _ = conn_id;
+        Ok(())
+    }
+
     /// Transform guest write bytes before they reach the native socket.
     /// Observe-only embeddings return `bytes` unchanged.
+    ///
+    /// Prefer [`Self::accept_tcp_write`]; this remains for G2-compatible callers.
     fn transform_tcp_write(&self, conn_id: u64, bytes: bytes::Bytes) -> bytes::Bytes {
-        let _ = conn_id;
-        bytes
+        match self.accept_tcp_write(conn_id, bytes.clone()) {
+            Ok(out) => out,
+            Err(_) => bytes::Bytes::new(),
+        }
     }
 }
 
