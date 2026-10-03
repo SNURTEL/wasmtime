@@ -23,6 +23,7 @@ pub struct TcpSocket {
     pub(crate) listener: Option<TcpListenStream>,
     /// Host tracing connection id assigned at start-connect (egress) or accept.
     pub(crate) trace_conn_id: Option<u64>,
+    pub(crate) trace_lease: Option<Arc<TraceLease>>,
     reader: Option<TcpReader>,
     writer: Option<TcpWriter>,
 }
@@ -41,6 +42,7 @@ impl TcpSocket {
             in_progress_operation: None,
             listener: None,
             trace_conn_id: None,
+            trace_lease: None,
             reader: None,
             writer: None,
         }
@@ -50,8 +52,22 @@ impl TcpSocket {
         observer: Option<Arc<dyn SocketBoundaryObserver>>,
         conn_id: u64,
     ) -> SocketResult<(DynInputStream, DynOutputStream)> {
-        let reader = TcpReader::new(self.inner.take_receive_stream()?, observer.clone(), conn_id);
-        let writer = TcpWriter::new(self.inner.take_send_stream()?, observer, conn_id);
+        let lease = self
+            .trace_lease
+            .get_or_insert_with(|| {
+                Arc::new(TraceLease {
+                    observer: observer.clone(),
+                    conn_id,
+                })
+            })
+            .clone();
+        let reader = TcpReader::new(
+            self.inner.take_receive_stream()?,
+            observer.clone(),
+            conn_id,
+            lease.clone(),
+        );
+        let writer = TcpWriter::new(self.inner.take_send_stream()?, observer, conn_id, lease);
         self.reader = Some(reader.clone());
         self.writer = Some(writer.clone());
         let input: DynInputStream = Box::new(reader);
@@ -71,6 +87,19 @@ impl TcpSocket {
         }
 
         Ok(())
+    }
+}
+
+/// Last-resource notification, retained by pending native writes as well as all socket resources.
+pub(crate) struct TraceLease {
+    pub(crate) observer: Option<Arc<dyn SocketBoundaryObserver>>,
+    pub(crate) conn_id: u64,
+}
+impl Drop for TraceLease {
+    fn drop(&mut self) {
+        if let Some(obs) = &self.observer {
+            obs.on_closed(self.conn_id);
+        }
     }
 }
 
@@ -121,17 +150,20 @@ struct TcpReader {
     state: Arc<Mutex<ReadState>>,
     observer: Option<Arc<dyn SocketBoundaryObserver>>,
     conn_id: u64,
+    _lease: Arc<TraceLease>,
 }
 impl TcpReader {
     fn new(
         stream: TcpReceiveStream,
         observer: Option<Arc<dyn SocketBoundaryObserver>>,
         conn_id: u64,
+        lease: Arc<TraceLease>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(ReadState::Open(stream))),
             observer,
             conn_id,
+            _lease: lease,
         }
     }
 }
@@ -139,10 +171,34 @@ impl TcpReader {
 #[async_trait::async_trait]
 impl InputStream for TcpReader {
     fn read(&mut self, size: usize) -> StreamResult<bytes::Bytes> {
-        let bytes = self.state.lock().unwrap().read(size)?;
+        if let Some(obs) = &self.observer {
+            obs.check_tcp_state(self.conn_id)
+                .map_err(|e| StreamError::LastOperationFailed(wasmtime::Error::msg(e.message())))?;
+        }
+        let (result, was_open) = {
+            let mut state = self.state.lock().unwrap();
+            let open = matches!(*state, ReadState::Open(_));
+            (state.read(size), open)
+        };
+        let bytes = match result {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                if was_open {
+                    if let Some(obs) = &self.observer {
+                        match &e {
+                            StreamError::Closed => obs.on_read_eof(self.conn_id),
+                            _ => obs.on_error(self.conn_id, "read-error"),
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        };
         if !bytes.is_empty() {
             if let Some(obs) = &self.observer {
-                obs.on_tcp_read(self.conn_id, &bytes);
+                obs.validate_tcp_read(self.conn_id, &bytes).map_err(|e| {
+                    StreamError::LastOperationFailed(wasmtime::Error::msg(e.message()))
+                })?;
             }
         }
         Ok(bytes)
@@ -152,7 +208,24 @@ impl InputStream for TcpReader {
 #[async_trait::async_trait]
 impl Pollable for TcpReader {
     async fn ready(&mut self) {
-        std::future::poll_fn(|cx| self.state.lock().unwrap().poll_ready(cx)).await
+        if let Some(obs) = &self.observer {
+            loop {
+                if obs.check_tcp_state(self.conn_id).is_err() {
+                    return;
+                }
+                if tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    std::future::poll_fn(|cx| self.state.lock().unwrap().poll_ready(cx)),
+                )
+                .await
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        } else {
+            std::future::poll_fn(|cx| self.state.lock().unwrap().poll_ready(cx)).await
+        }
     }
 }
 
@@ -194,7 +267,7 @@ impl WriteState {
         }
     }
 
-    fn write(&mut self, mut bytes: bytes::Bytes) -> StreamResult<()> {
+    fn write(&mut self, bytes: bytes::Bytes, lease: Arc<TraceLease>) -> StreamResult<()> {
         let mut stream = match self {
             WriteState::Ready(_, permit) if bytes.len() <= *permit => {
                 if bytes.is_empty() {
@@ -218,18 +291,24 @@ impl WriteState {
         };
 
         *self = WriteState::Writing(MaybeReady::poll_or_spawn(async move {
-            while !bytes.is_empty() {
-                match stream.write(&bytes).await {
-                    Ok(n) => {
-                        let _ = bytes.split_to(n);
-                    }
-                    Err(crate::sockets::ErrorCode::ConnectionBroken) => {
-                        return Err(WriteError::Closed);
-                    }
-                    Err(e) => {
-                        return Err(WriteError::LastOperationFailed(e.into()));
-                    }
+            if let Err(error) = crate::sockets::drain_tcp_write(
+                &mut stream,
+                bytes,
+                lease.observer.as_deref(),
+                lease.conn_id,
+            )
+            .await
+            {
+                if let Some(obs) = &lease.observer {
+                    obs.on_error(lease.conn_id, "native-write-error");
                 }
+                return Err(
+                    if matches!(error, crate::sockets::ErrorCode::ConnectionBroken) {
+                        WriteError::Closed
+                    } else {
+                        WriteError::LastOperationFailed(error.into())
+                    },
+                );
             }
 
             Ok(stream)
@@ -267,6 +346,11 @@ impl WriteState {
 
             s => s,
         };
+    }
+
+    fn abort(&mut self) {
+        // Dropping MaybeReady aborts its owned background task and releases its lease.
+        *self = WriteState::Closed(WriteError::Closed);
     }
 
     fn poll_ready(
@@ -310,20 +394,25 @@ impl WriteState {
 
 #[derive(Clone)]
 struct TcpWriter {
+    guest_permit: Arc<Mutex<usize>>,
     state: Arc<Mutex<WriteState>>,
     observer: Option<Arc<dyn SocketBoundaryObserver>>,
     conn_id: u64,
+    lease: Arc<TraceLease>,
 }
 impl TcpWriter {
     fn new(
         stream: TcpSendStream,
         observer: Option<Arc<dyn SocketBoundaryObserver>>,
         conn_id: u64,
+        lease: Arc<TraceLease>,
     ) -> Self {
         Self {
             state: Arc::new(Mutex::new(WriteState::Ready(stream, 0))),
+            guest_permit: Arc::new(Mutex::new(0)),
             observer,
             conn_id,
+            lease,
         }
     }
 }
@@ -331,6 +420,24 @@ impl TcpWriter {
 #[async_trait::async_trait]
 impl OutputStream for TcpWriter {
     fn write(&mut self, bytes: bytes::Bytes) -> StreamResult<()> {
+        // Check the original guest write, before a transformer can buffer it or change its size.
+        {
+            let state = self.state.lock().unwrap();
+            let mut permit = self.guest_permit.lock().unwrap();
+            match &*state {
+                WriteState::Closed(e) => return Err(e.clone().into()),
+                WriteState::Ready(_, _) if bytes.len() <= *permit => {
+                    if !bytes.is_empty() {
+                        *permit = 0;
+                    }
+                }
+                _ => {
+                    return Err(StreamError::trap(
+                        "guest write exceeds the last check-write permit",
+                    ));
+                }
+            }
+        }
         let bytes = if let Some(obs) = &self.observer {
             match obs.accept_tcp_write(self.conn_id, bytes) {
                 Ok(b) => b,
@@ -346,15 +453,19 @@ impl OutputStream for TcpWriter {
         if bytes.is_empty() {
             return Ok(());
         }
-        self.state.lock().unwrap().write(bytes)
+        self.state.lock().unwrap().write(bytes, self.lease.clone())
     }
 
     fn flush(&mut self) -> StreamResult<()> {
         if let Some(obs) = &self.observer {
-            if let Err(e) = obs.flush_tcp_write(self.conn_id) {
-                return Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
-                    e.message(),
-                )));
+            let pending = obs
+                .take_flush_tcp_write(self.conn_id)
+                .map_err(|e| StreamError::LastOperationFailed(wasmtime::Error::msg(e.message())))?;
+            if !pending.is_empty() {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .write(pending, self.lease.clone())?;
             }
         }
         self.state.lock().unwrap().flush()
@@ -362,16 +473,15 @@ impl OutputStream for TcpWriter {
 
     fn check_write(&mut self) -> StreamResult<usize> {
         let native = self.state.lock().unwrap().check_write()?;
-        if let Some(obs) = &self.observer {
-            match obs.check_tcp_write(self.conn_id, native) {
-                Ok(n) => Ok(n),
-                Err(e) => Err(StreamError::LastOperationFailed(wasmtime::Error::msg(
-                    e.message(),
-                ))),
-            }
+        let permit = if let Some(obs) = &self.observer {
+            obs.check_tcp_write(self.conn_id, native)
+                .map_err(|e| StreamError::LastOperationFailed(wasmtime::Error::msg(e.message())))?
+                .min(native)
         } else {
-            Ok(native)
-        }
+            native
+        };
+        *self.guest_permit.lock().unwrap() = permit;
+        Ok(permit)
     }
 
     fn write_zeroes(&mut self, nelem: usize) -> StreamResult<()> {
@@ -389,13 +499,46 @@ impl OutputStream for TcpWriter {
     async fn cancel(&mut self) {
         // Wait for background writes to finish in order to prevent silently
         // dropping data that (from the guest's perspective) was already written.
-        self.ready().await
+        if self.observer.is_some() {
+            if tokio::time::timeout(std::time::Duration::from_secs(2), self.ready())
+                .await
+                .is_err()
+            {
+                self.state.lock().unwrap().abort();
+                if let Some(obs) = &self.observer {
+                    obs.on_error(self.conn_id, "cancel-timeout");
+                }
+            }
+            if let Some(obs) = &self.observer {
+                obs.on_write_closed(self.conn_id);
+            }
+        } else {
+            self.ready().await
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl Pollable for TcpWriter {
     async fn ready(&mut self) {
-        poll_fn(|cx| self.state.lock().unwrap().poll_ready(cx).map(|_| ())).await;
+        if let Some(observer) = &self.observer {
+            loop {
+                if observer.check_tcp_state(self.conn_id).is_err() {
+                    self.state.lock().unwrap().abort();
+                    return;
+                }
+                if tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    poll_fn(|cx| self.state.lock().unwrap().poll_ready(cx).map(|_| ())),
+                )
+                .await
+                .is_ok()
+                {
+                    return;
+                }
+            }
+        } else {
+            poll_fn(|cx| self.state.lock().unwrap().poll_ready(cx).map(|_| ())).await;
+        }
     }
 }

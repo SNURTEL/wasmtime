@@ -503,6 +503,12 @@ impl Component {
         self.inner.static_modules.values()
     }
 
+    /// Core modules in static-module order, for embeddings using qualified debug recipes.
+    #[cfg(feature = "debug")]
+    pub fn debug_static_modules(&self) -> impl Iterator<Item = &Module> {
+        self.inner.static_modules.values()
+    }
+
     #[inline]
     pub(crate) fn types(&self) -> &Arc<ComponentTypes> {
         match self.inner.code.types() {

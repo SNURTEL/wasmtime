@@ -102,6 +102,19 @@ pub trait SocketBoundaryObserver: Send + Sync {
     }
 
     fn on_tcp_read(&self, conn_id: u64, bytes: &[u8]);
+    /// Validate delivered bytes; legacy observers remain source compatible.
+    fn validate_tcp_read(&self, conn_id: u64, bytes: &[u8]) -> Result<(), TcpBoundaryError> {
+        self.on_tcp_read(conn_id, bytes);
+        Ok(())
+    }
+    fn check_tcp_state(&self, _conn_id: u64) -> Result<(), TcpBoundaryError> {
+        Ok(())
+    }
+    fn on_read_eof(&self, _conn_id: u64) {}
+    fn on_wire_committed(&self, _conn_id: u64, _bytes: usize) {}
+    fn on_write_closed(&self, _conn_id: u64) {}
+    fn on_error(&self, _conn_id: u64, _reason: &str) {}
+    fn on_closed(&self, _conn_id: u64) {}
 
     /// Accept guest write bytes. Returns wire bytes to send to the native socket
     /// (may be empty while buffering an incomplete HTTP head).
@@ -130,6 +143,12 @@ pub trait SocketBoundaryObserver: Send + Sync {
         Ok(())
     }
 
+    /// Optional bytes released by a diagnostic fallback when flushing a partial head.
+    fn take_flush_tcp_write(&self, conn_id: u64) -> Result<bytes::Bytes, TcpBoundaryError> {
+        self.flush_tcp_write(conn_id)?;
+        Ok(bytes::Bytes::new())
+    }
+
     /// Transform guest write bytes before they reach the native socket.
     /// Observe-only embeddings return `bytes` unchanged.
     ///
@@ -140,6 +159,38 @@ pub trait SocketBoundaryObserver: Send + Sync {
             Err(_) => bytes::Bytes::new(),
         }
     }
+}
+
+/// Native write transport, allowing deterministic short-write tests of the decorated drain path.
+pub trait TcpWriteTransport {
+    fn write<'a>(
+        &'a mut self,
+        bytes: &'a [u8],
+    ) -> impl Future<Output = Result<usize, ErrorCode>> + Send;
+}
+impl TcpWriteTransport for TcpSendStream {
+    async fn write<'a>(&'a mut self, bytes: &'a [u8]) -> Result<usize, ErrorCode> {
+        TcpSendStream::write(self, bytes).await
+    }
+}
+/// Drain one accepted write and report each native commitment, including short writes.
+pub async fn drain_tcp_write<W: TcpWriteTransport>(
+    stream: &mut W,
+    mut bytes: bytes::Bytes,
+    observer: Option<&dyn SocketBoundaryObserver>,
+    conn_id: u64,
+) -> Result<(), ErrorCode> {
+    while !bytes.is_empty() {
+        let n = stream.write(&bytes).await?;
+        if n == 0 || n > bytes.len() {
+            return Err(ErrorCode::ConnectionBroken);
+        }
+        if let Some(obs) = observer {
+            obs.on_wire_committed(conn_id, n);
+        }
+        let _ = bytes.split_to(n);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Default)]

@@ -74,6 +74,12 @@ impl crate::p2::host::tcp::tcp::HostTcpSocket for WasiSocketsCtxView<'_> {
             None
         };
         socket.trace_conn_id = conn_id;
+        if let Some(conn_id) = conn_id {
+            socket.trace_lease = Some(std::sync::Arc::new(crate::p2::tcp::TraceLease {
+                observer: self.ctx.boundary_observer.clone(),
+                conn_id,
+            }));
+        }
 
         socket.inner.start_connect(remote_address)?;
         socket.in_progress_operation = Some(AsyncOperation::Connect);
