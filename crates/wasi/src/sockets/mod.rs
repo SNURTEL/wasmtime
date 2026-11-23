@@ -78,7 +78,7 @@ impl TcpBoundaryError {
         match self {
             Self::PartialHeadFlush => "wasmtrace: partial-head flush while buffering request head",
             Self::HeaderTooLarge => "wasmtrace: request head too large",
-            Self::SecondExchange => "wasmtrace: second HTTP exchange on connection",
+            Self::SecondExchange => "wasmtrace: HTTP request before connection is reusable",
             Self::Protocol => "wasmtrace: HTTP framing error",
             Self::Failed => "wasmtrace: egress stream failed",
             Self::Unsupported(s) => s,

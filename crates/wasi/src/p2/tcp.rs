@@ -83,7 +83,7 @@ impl TcpSocket {
         }
 
         if let Shutdown::Both | Shutdown::Write = how {
-            writer.state.lock().unwrap().shutdown();
+            writer.state.lock().unwrap().shutdown(&writer.lease);
         }
 
         Ok(())
@@ -99,6 +99,14 @@ impl Drop for TraceLease {
     fn drop(&mut self) {
         if let Some(obs) = &self.observer {
             obs.on_closed(self.conn_id);
+        }
+    }
+}
+impl TraceLease {
+    /// Report that the socket write half has completed shutdown.
+    fn write_closed(&self) {
+        if let Some(observer) = &self.observer {
+            observer.on_write_closed(self.conn_id);
         }
     }
 }
@@ -268,7 +276,7 @@ impl WriteState {
     }
 
     fn write(&mut self, bytes: bytes::Bytes, lease: Arc<TraceLease>) -> StreamResult<()> {
-        let mut stream = match self {
+        let stream = match self {
             WriteState::Ready(_, permit) if bytes.len() <= *permit => {
                 if bytes.is_empty() {
                     return Ok(());
@@ -290,35 +298,76 @@ impl WriteState {
             }
         };
 
-        *self = WriteState::Writing(MaybeReady::poll_or_spawn(async move {
-            if let Err(error) = crate::sockets::drain_tcp_write(
-                &mut stream,
-                bytes,
-                lease.observer.as_deref(),
-                lease.conn_id,
-            )
-            .await
-            {
-                if let Some(obs) = &lease.observer {
-                    obs.on_error(lease.conn_id, "native-write-error");
-                }
-                return Err(
-                    if matches!(error, crate::sockets::ErrorCode::ConnectionBroken) {
-                        WriteError::Closed
-                    } else {
-                        WriteError::LastOperationFailed(error.into())
-                    },
-                );
-            }
-
-            Ok(stream)
-        }));
+        *self = Self::Writing(MaybeReady::poll_or_spawn(Self::drain(stream, bytes, lease)));
 
         // Attempt to finish the write, surfacing potential errors immediately:
         match self.poll_ready(&mut noop_cx()) {
             Poll::Pending | Poll::Ready(Ok(_)) => Ok(()),
             Poll::Ready(Err(e)) => Err(e),
         }
+    }
+
+    /// Drain accepted bytes and return the native send stream when all bytes commit.
+    ///
+    /// # Arguments
+    /// - `stream`: Exclusive native send stream for the write.
+    /// - `bytes`: Accepted wire bytes in stream order.
+    /// - `lease`: Connection identity and completion observer.
+    ///
+    /// # Returns
+    /// The stream ready for another write, or a native write error.
+    async fn drain(
+        mut stream: TcpSendStream,
+        bytes: bytes::Bytes,
+        lease: Arc<TraceLease>,
+    ) -> Result<TcpSendStream, WriteError> {
+        if let Err(error) = crate::sockets::drain_tcp_write(
+            &mut stream,
+            bytes,
+            lease.observer.as_deref(),
+            lease.conn_id,
+        )
+        .await
+        {
+            if let Some(observer) = &lease.observer {
+                observer.on_error(lease.conn_id, "native-write-error");
+            }
+            return Err(
+                if matches!(error, crate::sockets::ErrorCode::ConnectionBroken) {
+                    WriteError::Closed
+                } else {
+                    WriteError::LastOperationFailed(error.into())
+                },
+            );
+        }
+        Ok(stream)
+    }
+
+    /// Release original bytes withheld from an already accepted write during best-effort flush.
+    ///
+    /// # Arguments
+    /// - `bytes`: Original bytes previously admitted against a guest write permit.
+    /// - `lease`: Connection identity and completion observer.
+    ///
+    /// # Returns
+    /// Success once the pending bytes are queued behind any previous output.
+    ///
+    /// # Errors
+    /// Returns a stream error if the native send stream has started closing.
+    fn flush_pending(&mut self, bytes: bytes::Bytes, lease: Arc<TraceLease>) -> StreamResult<()> {
+        let write = match self.take() {
+            Self::Ready(stream, _) => MaybeReady::poll_or_spawn(Self::drain(stream, bytes, lease)),
+            Self::Writing(previous) => MaybeReady::poll_or_spawn(async move {
+                let stream = previous.into_future().await?;
+                Self::drain(stream, bytes, lease).await
+            }),
+            state => {
+                *self = state;
+                return Err(WriteError::Closed.into());
+            }
+        };
+        *self = Self::Writing(write);
+        Ok(())
     }
 
     fn flush(&mut self) -> StreamResult<()> {
@@ -331,15 +380,25 @@ impl WriteState {
         }
     }
 
-    pub(crate) fn shutdown(&mut self) {
+    /// Shut down the native write half after all accepted bytes commit.
+    ///
+    /// # Arguments
+    /// - `lease`: Connection identity to report once the native send stream closes.
+    fn shutdown(&mut self, lease: &Arc<TraceLease>) {
         *self = match self.take() {
-            // No write in progress, immediately drop the inner stream:
-            WriteState::Ready(..) => WriteState::Closed(WriteError::Closed),
+            WriteState::Ready(stream, _) => {
+                drop(stream);
+                lease.write_closed();
+                WriteState::Closed(WriteError::Closed)
+            }
 
             // Schedule the shutdown after the current write has finished:
             WriteState::Writing(write) => {
+                let lease = Arc::clone(lease);
                 WriteState::Closing(MaybeReady::poll_or_spawn(async move {
-                    _ = write.into_future().await?;
+                    let stream = write.into_future().await?;
+                    drop(stream);
+                    lease.write_closed();
                     Ok(())
                 }))
             }
@@ -465,7 +524,7 @@ impl OutputStream for TcpWriter {
                 self.state
                     .lock()
                     .unwrap()
-                    .write(pending, self.lease.clone())?;
+                    .flush_pending(pending, self.lease.clone())?;
             }
         }
         self.state.lock().unwrap().flush()
@@ -508,9 +567,6 @@ impl OutputStream for TcpWriter {
                 if let Some(obs) = &self.observer {
                     obs.on_error(self.conn_id, "cancel-timeout");
                 }
-            }
-            if let Some(obs) = &self.observer {
-                obs.on_write_closed(self.conn_id);
             }
         } else {
             self.ready().await
